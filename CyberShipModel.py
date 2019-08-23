@@ -98,7 +98,7 @@ class SimPara(object):
     """contain the parameters for guiding the simulation process
     """
 
-    def __init__(self, init_mode=SimInitType.rand, init_eta=np.array([5, 5, 5]), init_vi=np.array([1, 1, 1]),
+    def __init__(self, init_mode=SimInitType.rand, init_eta=np.array([5., 5., 0.]), init_vi=np.array([1, 1, 0]),
                  enable_sensor_sys=False):
         """ init the parameters for simulation process, focus on conditions during an episode
         :param init_mode:
@@ -189,7 +189,7 @@ class CyberShipModel(object):
             self.vi = self.generate_init_vi()
         else:
             self.vi = vi
-            self.eta[2] = eta[2] * D2R
+            self.vi[2] = vi[2] * D2R
 
         # sensor system reset
         if self.simPara.enableSensorSys:
@@ -207,19 +207,21 @@ class CyberShipModel(object):
         """
         # variable used repeatedly
         # M = np.array([[25.8, 0, 0], [0, 33.8, 6.2], [0, 6.2, 2.76]])
+        # state[4] = 0
         m_inv = np.array([[0.03875969,  0.,  0.],
                           [0.,  0.05032089, -0.11303967],
                           [0., -0.11303967,  0.61624854]])
 
         c = np.array([[0, 0, -33.8 * state[4] + 6.2 * state[5]],
-                      0, 0, 25.8 * state[3],
-                      33.8 * state[4] - 6.2 * state[5], -25.8 * state[3], 0])
+                      [0, 0, 25.8 * state[3]],
+                      [33.8 * state[4] - 6.2 * state[5], -25.8 * state[3], 0]])
         d = np.array([[12 + 2.5 * np.abs(state[3]), 0, 0],
                       [0, 17 + 4.5 * np.abs(state[4]), 0.2],
-                      0, 0.5, 0.5 + 0.1 * np.abs(state[5])])
+                      [0, 0.5, 0.5 + 0.1 * np.abs(state[5])]])
         rot = np.array([[np.cos(state[2]), -np.sin(state[2]), 0],
                         [np.sin(state[2]), np.cos(state[2]), 0],
                        [0, 0, 1]])
+        # state[4] = 0
         nu = state[3:6]
         action[1] = 0
         t2 = action
@@ -228,6 +230,7 @@ class CyberShipModel(object):
         # dynamic of position cycle
         dot_state[0:3] = np.dot(rot, nu)
         dot_state[3:6] = np.dot(m_inv, t2 - c.dot(nu) - d.dot(nu))
+        # print(t2,  c.dot(nu), d.dot(nu))
 
         ''' Just used for test
         temp1 = state[10] * state[11] * (para.uavInertia[1] - para.uavInertia[2]) / para.uavInertia[0]
@@ -355,6 +358,19 @@ class CyberShipModel(object):
     #     return action_pid, oil_altitude
 
 
+class GuideLine(object):
+    """contain the functions for guiderline calculation
+    """
+    def __init__(self, p1=np.array([0, 0]), p2=np.array([0, 0])):
+        self.k = (p2[1] - p1[1]) / (p2[0] - p1[0])  # real tan(theta)
+        self.b = self.k * p1[0] - p1[1]
+        self.theta = np.arctan(self.k)
+
+    def dis_line2point(self, px, py):
+        dis_result = (-self.k * px + py + self.b) / np.sqrt(self.k * self.k + 1)
+        return dis_result
+
+
 if __name__ == '__main__':
     " used for testing this module"
     testFlag = 3
@@ -368,25 +384,64 @@ if __name__ == '__main__':
         import matplotlib as mpl
         print("PID  controller test: ")
         mPara = ModelPara()
-        sPara = SimPara(init_mode=SimInitType.fixed)
+        sPara = SimPara(init_mode=SimInitType.fixed, init_eta=np.array([0., 0., 0.]), init_vi=np.array([0, 0, 0]))
         ship1 = CyberShipModel(mPara, sPara)
+        ship1.reset_states()
         record = MemoryStore.DataRecord()
         record.clear()
         step_cnt = 0
-        for i in range(1000):
-            ref = np.array([0., 0., 1., 0.])
+
+        # 0.1 prepare the guider line
+        guid_p1 = np.array([0, 0])
+        guid_p2 = np.array([2, 2])
+        gl1 = GuideLine(guid_p1, guid_p2)
+        # print(guid_k, guid_b)
+
+        # control gain
+        guid_kd = 0.3
+        vi_i = 0  # i on v_u
+        for i in range(5000):
             stateTemp = ship1.observe()
             # action2, oil = ship1.get_controller_pid(stateTemp, ref)
-            print('action: ', action2)
-            action2 = np.clip(action2, 0.1, 0.9)
-            quad1.step(action2)
-            record.buffer_append((stateTemp, action2))
+
+            # 1.1 calculate the v in world frame according to guider-line
+            guid_d = gl1.dis_line2point(stateTemp[0], stateTemp[1])
+            v_d = -guid_d * guid_kd
+            # print(guid_d)
+            v0 = 1
+            v_X = -v_d * np.cos(gl1.theta) + v0 * np.sin(gl1.theta)
+            v_Y = v_d * np.sin(gl1.theta) + v0 * np.cos(gl1.theta)
+            # considering the effect of v_v
+            vxx = v_X + stateTemp[4] * np.sin(stateTemp[2])
+            vyy = v_Y - stateTemp[4] * np.cos(stateTemp[2])
+
+            # 1.2 calculate the v in body frame according to the v_world
+            v_u = np.sqrt(vxx * vxx + vyy * vyy) * np.sign(vxx) * np.sign(np.cos(stateTemp[2]))
+            v_u = np.clip(v_u, -1.3, 1.3)
+            phi = np.arctan2(vyy, vxx)
+            print(guid_d, v_d, phi / D2R)
+
+            # 1.3 calculate the final action
+            action = np.zeros(3)
+            error = v_u - stateTemp[3]
+            vi_i = vi_i + error
+            action[0] = error * 3 + vi_i * 0.016
+            phi_dot = (phi - stateTemp[2]) * 2
+            action[2] = (phi_dot - stateTemp[5]) * 20
+
+            # print(phi, phi_dot, stateTemp[2], stateTemp[5])
+            # action2 = np.random.rand(3)
+            # print('action: ', action)
+            # action2 = np.clip(action2, 0.1, 0.9)
+            ship1.step(action)
+            # test
+            action[1] = phi
+            stateTemp[4] = v_u
+            # stateTemp[4] = phi_dot
+            record.buffer_append((stateTemp, action))
             step_cnt = step_cnt + 1
         record.episode_append()
 
-        print('Quadrotor structure type', quad1.uavPara.structureType)
-        # quad1.reset_states()
-        print('Quadrotor get reward:', quad1.get_reward())
         data = record.get_episode_buffer()
         bs = data[0]
         ba = data[1]
@@ -395,18 +450,41 @@ if __name__ == '__main__':
         fig1 = plt.figure(1)
         plt.clf()
         plt.subplot(3, 1, 1)
-        plt.plot(t, bs[t, 6] / D2R, label='roll')
-        plt.plot(t, bs[t, 7] / D2R, label='pitch')
-        plt.plot(t, bs[t, 8] / D2R, label='yaw')
-        plt.ylabel('Attitude $(\circ)$', fontsize=15)
+        tss = range(500)
+        plt.plot(bs[t, 0], bs[t, 1], label='xy')
+        plt.plot(np.arange(0, 17, 1), np.arange(0, 17, 1), '--r', label='line')
+        # plt.plot(t, bs[t, 1], label='y')
+        # plt.plot(t, bs[t, 2] / D2R, label='yaw')
+        plt.ylabel('Eta $(\circ)$', fontsize=15)
         plt.legend(fontsize=15, bbox_to_anchor=(1, 1.05))
         plt.subplot(3, 1, 2)
-        plt.plot(t, bs[t, 0], label='x')
-        plt.plot(t, bs[t, 1], label='y')
-        plt.ylabel('Position (m)', fontsize=15)
+        # plt.plot(t, bs[t, 3], label='u')
+        plt.plot(t, bs[t, 3], label='v_real')
+        plt.plot(t, bs[t, 4], label='v_ref')
+        plt.ylabel('Vi (m)', fontsize=15)
         plt.legend(fontsize=15, bbox_to_anchor=(1, 1.05))
         plt.subplot(3, 1, 3)
-        plt.plot(t, bs[t, 2], label='z')
+        plt.plot(t, bs[t, 2] / D2R, label='phi_real')
+        plt.plot(t, ba[t, 1] / D2R, label='phi_ref')
         plt.ylabel('Altitude (m)', fontsize=15)
         plt.legend(fontsize=15, bbox_to_anchor=(1, 1.05))
         plt.show()
+
+        # plt.subplot(3, 1, 1)
+        # plt.plot(t, bs[t, 0], label='x')
+        # plt.plot(t, bs[t, 1], label='y')
+        # plt.plot(t, bs[t, 2] / D2R, label='yaw')
+        # plt.ylabel('Eta $(\circ)$', fontsize=15)
+        # plt.legend(fontsize=15, bbox_to_anchor=(1, 1.05))
+        # plt.subplot(3, 1, 2)
+        # plt.plot(t, bs[t, 3], label='u')
+        # plt.plot(t, bs[t, 4], label='v')
+        # plt.plot(t, bs[t, 5], label='r')
+        # plt.ylabel('Vi (m)', fontsize=15)
+        # plt.legend(fontsize=15, bbox_to_anchor=(1, 1.05))
+        # plt.subplot(3, 1, 3)
+        # plt.plot(t, ba[t, 0], label='z')
+        # plt.plot(t, ba[t, 2], label='z')
+        # plt.ylabel('Altitude (m)', fontsize=15)
+        # plt.legend(fontsize=15, bbox_to_anchor=(1, 1.05))
+        # plt.show()
