@@ -146,6 +146,10 @@ class CyberShipModel(object):
         # initial the states
         self.reset_states()
 
+        # initial the pid controller variable
+        self.pidEtaI = np.zeros(3)
+        self.pidViI = np.zeros(3)
+
     @property
     def ts(self):
         """return the tick of system"""
@@ -299,6 +303,15 @@ class CyberShipModel(object):
         reward = self.get_reward()
 
         return ob, reward, finish_flag
+
+    def get_speed_yaw_controller_pid(self, state, ref_speed, ref_yaw):
+        action_pid = np.zeros(3)
+        err = ref_speed - state[3]
+        self.pidViI[0] = self.pidViI[0] + err
+        action_pid[0] = err * 3 + self.pidViI[0] * 0.016
+        phi_dot_ref = (ref_yaw - state[2]) * 2
+        action_pid[2] = (phi_dot_ref - state[5]) * 20
+        return action_pid
 
     # def get_controller_pid(self, state, ref_state=np.array([0, 0, 1, 0])):
     #     """ pid controller
